@@ -287,6 +287,19 @@ describe('SummaryService', () => {
     const result = await service.generate({ events, characters, tone: 'serious', length: 'medium', sessionId: 's1', campaignName: 'Test' })
     expect(result.generatedAt).toBeGreaterThanOrEqual(before)
   })
+
+  it('uses 3-segment chunking for sessions over 300 in-game events', async () => {
+    // Generate 301 in-game events
+    const manyEvents: SessionEvent[] = Array.from({ length: 301 }, (_, i) => ({
+      id: `e${i}`, sessionId: 's1', timestamp: 1000 + i, speaker: 'Theron',
+      rawText: `Action ${i}`, eventType: 'action' as const, inGame: true, confidence: 0.95, flagged: false
+    }))
+    const service = new SummaryService({ apiKey: 'test' })
+    // 3 segment calls + 1 combine call = 4 total Claude calls
+    const createSpy = vi.mocked(require('@anthropic-ai/sdk').default().messages.create)
+    await service.generate({ events: manyEvents, characters, tone: 'serious', length: 'medium', sessionId: 's1', campaignName: 'Test' })
+    expect(createSpy.mock.calls.length).toBeGreaterThanOrEqual(4)
+  })
 })
 ```
 
@@ -311,6 +324,7 @@ import { SummaryPayload } from '../output/outputPlugin'
 import { buildSummaryPrompt, buildStructuredLog } from './summaryPrompt'
 
 const MODEL = 'claude-sonnet-4-6'
+const MAX_EVENTS_PER_REQUEST = 300
 
 export interface GenerateOptions {
   sessionId: string
@@ -328,24 +342,52 @@ export class SummaryService {
     this.client = new Anthropic({ apiKey: config.apiKey })
   }
 
-  async generate(options: GenerateOptions): Promise<SummaryPayload> {
-    const { sessionId, campaignName, events, characters, tone, length } = options
-    const prompt = buildSummaryPrompt(events, characters, tone, length)
-
+  private async callClaude(prompt: string): Promise<string> {
     const response = await this.client.messages.create({
       model: MODEL,
       max_tokens: 2000,
       system: 'You are a campaign journal writer for tabletop RPG sessions. Write vivid, engaging prose.',
       messages: [{ role: 'user', content: prompt }]
     })
+    return response.content[0].type === 'text' ? response.content[0].text : ''
+  }
 
-    const narrativeSummary = response.content[0].type === 'text' ? response.content[0].text : ''
+  async generate(options: GenerateOptions): Promise<SummaryPayload> {
+    const { sessionId, campaignName, events, characters, tone, length } = options
+    const inGameEvents = events.filter(e => e.inGame)
+    const structuredLog = buildStructuredLog(events, characters)
+
+    let narrativeSummary: string
+
+    if (inGameEvents.length <= MAX_EVENTS_PER_REQUEST) {
+      // Single-pass: fits within token budget
+      narrativeSummary = await this.callClaude(buildSummaryPrompt(events, characters, tone, length))
+    } else {
+      // Multi-pass: split into 3 equal segments, summarize each, then combine
+      const segmentSize = Math.ceil(inGameEvents.length / 3)
+      const segments = [
+        inGameEvents.slice(0, segmentSize),
+        inGameEvents.slice(segmentSize, segmentSize * 2),
+        inGameEvents.slice(segmentSize * 2)
+      ]
+
+      const segmentSummaries = await Promise.all(
+        segments.map((seg, i) => {
+          const label = i === 0 ? 'early session' : i === 1 ? 'mid session' : 'late session'
+          const segPrompt = `Summarize these D&D session events in 2 sentences (${label}):\n\n${buildStructuredLog(seg, characters)}`
+          return this.callClaude(segPrompt)
+        })
+      )
+
+      const combinePrompt = `Combine these 3 segment summaries into one ${length}, ${tone}-tone "Previously on your campaign..." narrative in 2 paragraphs. Write in third person, past tense.\n\n${segmentSummaries.map((s, i) => `Segment ${i + 1}: ${s}`).join('\n\n')}`
+      narrativeSummary = await this.callClaude(combinePrompt)
+    }
 
     return {
       sessionId,
       campaignName,
       narrativeSummary,
-      structuredLog: buildStructuredLog(events, characters),
+      structuredLog,
       generatedAt: Date.now()
     }
   }
@@ -454,13 +496,31 @@ export class MarkdownOutput implements OutputPlugin {
     return this.config.enabled && !!this.config.folder
   }
 
+  private validateFolder(folder: string): string {
+    const resolved = path.resolve(folder)
+    // Guard against symlink traversal outside home directory
+    let real: string
+    try {
+      real = fs.realpathSync(resolved)
+    } catch {
+      // Directory doesn't exist yet — check the resolved path instead
+      real = resolved
+    }
+    const home = require('os').homedir()
+    if (!real.startsWith(home)) {
+      throw new Error('Campaign must be saved inside your home directory.')
+    }
+    return real
+  }
+
   async deliver(payload: SummaryPayload): Promise<void> {
+    const safeFolder = this.validateFolder(this.config.folder)
     const date = new Date(payload.generatedAt)
     const dateStr = date.toISOString().split('T')[0]
     const filename = `${dateStr}-${payload.sessionId.slice(0, 8)}.md`
-    const filePath = path.join(this.config.folder, filename)
+    const filePath = path.join(safeFolder, filename)
 
-    fs.mkdirSync(this.config.folder, { recursive: true })
+    fs.mkdirSync(safeFolder, { recursive: true })
 
     const content = `# ${payload.campaignName} — Session Notes
 *Generated: ${date.toLocaleString()}*
@@ -593,10 +653,12 @@ git commit -m "feat: add clipboard output plugin"
 **Files:**
 - Create: `src/main/output/pdfOutput.ts`
 
-- [ ] **Step 1: Install puppeteer**
+- [ ] **Step 1: Install puppeteer-core**
+
+Use `puppeteer-core` instead of `puppeteer` — full `puppeteer` bundles a separate Chromium download (~300 MB) which would bloat the Electron installer. `puppeteer-core` uses Electron's own Chromium binary.
 
 ```bash
-npm install puppeteer
+npm install puppeteer-core
 ```
 
 - [ ] **Step 2: Implement PdfOutput**
@@ -618,8 +680,13 @@ export class PdfOutput implements OutputPlugin {
   }
 
   async deliver(payload: SummaryPayload): Promise<void> {
-    const puppeteer = await import('puppeteer')
-    const browser = await puppeteer.default.launch({ headless: true })
+    const puppeteer = await import('puppeteer-core')
+    // Reuse Electron's bundled Chromium — avoids shipping a second browser
+    const browser = await puppeteer.default.launch({
+      executablePath: process.execPath,
+      headless: true,
+      args: ['--no-sandbox']
+    })
     const page = await browser.newPage()
 
     const html = this.buildHtml(payload)
@@ -781,8 +848,8 @@ ipcMain.handle('summary:generate', async (_e, campaignId: string, sessionId: str
     campaignName: campaign.name,
     events,
     characters: campaign.characters,
-    tone: 'serious',
-    length: 'medium'
+    tone: settings.summaryTone ?? 'serious',
+    length: settings.summaryLength ?? 'medium'
   })
 
   const outputFolder = settings.output.markdownFolder || path.join(getBasePath(), 'summaries')
@@ -1147,7 +1214,340 @@ git commit -m "feat: add Discord setup wizard to settings"
 
 ---
 
-### Task 11: Run full test suite and push
+### Task 11: Split handlers.ts into domain files (CEO Gap 5)
+
+By now `handlers.ts` contains settings, campaign, character, session, model, and summary handlers — ~200 lines. Split into focused files to keep each domain manageable.
+
+**Files:**
+- Create: `src/main/ipc/sessionHandlers.ts`
+- Create: `src/main/ipc/campaignHandlers.ts`
+- Create: `src/main/ipc/summaryHandlers.ts`
+- Create: `src/main/ipc/settingsHandlers.ts`
+- Modify: `src/main/ipc/handlers.ts` — becomes a thin orchestrator that calls the four domain modules
+
+- [ ] **Step 1: Extract into domain handler files**
+
+Create `src/main/ipc/settingsHandlers.ts`:
+
+```ts
+import { ipcMain } from 'electron'
+import { SettingsStore } from '../storage/settingsStore'
+import { AppSettings } from '../models/settings'
+
+export function registerSettingsHandlers(settingsStore: SettingsStore): void {
+  ipcMain.handle('settings:load', () => settingsStore.load())
+  ipcMain.handle('settings:save', (_e, settings: AppSettings) => settingsStore.save(settings))
+  ipcMain.handle('settings:setSecret', (_e, key: string, value: string) =>
+    settingsStore.setSecret(key, value))
+  ipcMain.handle('settings:getSecretExists', async (_e, key: string) => {
+    const val = await settingsStore.getSecret(key)
+    return val !== null
+  })
+}
+```
+
+Create `src/main/ipc/campaignHandlers.ts`:
+
+```ts
+import { ipcMain } from 'electron'
+import { CampaignStore } from '../storage/campaignStore'
+import { Campaign, Character } from '../models/campaign'
+
+export function registerCampaignHandlers(campaignStore: CampaignStore): void {
+  ipcMain.handle('campaign:list', () => campaignStore.listCampaignIds())
+  ipcMain.handle('campaign:load', (_e, id: string) => campaignStore.loadCampaign(id))
+  ipcMain.handle('campaign:save', (_e, campaign: Campaign) => campaignStore.saveCampaign(campaign))
+  ipcMain.handle('character:add', (_e, campaignId: string, character: Character) =>
+    campaignStore.addCharacter(campaignId, character))
+  ipcMain.handle('character:update', (_e, campaignId: string, character: Character) =>
+    campaignStore.updateCharacter(campaignId, character))
+  ipcMain.handle('character:archive', (_e, campaignId: string, characterId: string) =>
+    campaignStore.archiveCharacter(campaignId, characterId))
+}
+```
+
+Create `src/main/ipc/summaryHandlers.ts` (move `summary:generate` handler here):
+
+```ts
+import { ipcMain } from 'electron'
+import { CampaignStore } from '../storage/campaignStore'
+import { SettingsStore } from '../storage/settingsStore'
+import { SummaryService } from '../summary/summaryService'
+import { MarkdownOutput } from '../output/markdownOutput'
+import { ClipboardOutput } from '../output/clipboardOutput'
+import { PdfOutput } from '../output/pdfOutput'
+import { DiscordOutput } from '../output/discordOutput'
+import { SessionStore } from '../storage/sessionStore'
+import { getSessionPath, getBasePath } from '../storage/paths'
+import path from 'path'
+
+export function registerSummaryHandlers(
+  campaignStore: CampaignStore,
+  settingsStore: SettingsStore
+): void {
+  ipcMain.handle('summary:generate', async (_e, campaignId: string, sessionId: string) => {
+    const settings = settingsStore.load()
+    const apiKey = await settingsStore.getSecret('claude-api-key')
+    if (!apiKey) throw new Error('Claude API key not configured. Add it in Settings.')
+
+    const campaign = campaignStore.loadCampaign(campaignId)
+    if (!campaign) throw new Error(`Campaign ${campaignId} not found`)
+
+    const dbPath = getSessionPath(campaignId, sessionId)
+    const store = new SessionStore(dbPath)
+    const events = store.getEvents(sessionId)
+    store.close()
+
+    const service = new SummaryService({ apiKey })
+    const payload = await service.generate({
+      sessionId, campaignName: campaign.name, events,
+      characters: campaign.characters,
+      tone: settings.summaryTone ?? 'serious',
+      length: settings.summaryLength ?? 'medium'
+    })
+
+    const outputFolder = settings.output.markdownFolder || path.join(getBasePath(), 'summaries')
+    const plugins = [
+      new MarkdownOutput({ folder: outputFolder, enabled: settings.output.markdownEnabled }),
+      new ClipboardOutput({ enabled: settings.output.clipboardEnabled }),
+    ]
+
+    if (settings.output.discordEnabled && settings.output.discordChannelId) {
+      const botToken = await settingsStore.getSecret('discord-bot-token')
+      if (botToken) {
+        plugins.push(new DiscordOutput({ botToken, channelId: settings.output.discordChannelId, enabled: true }))
+      }
+    }
+
+    await Promise.all(plugins.filter(p => p.isEnabled()).map(p => p.deliver(payload)))
+    return payload
+  })
+}
+```
+
+- [ ] **Step 2: Update handlers.ts to be a thin orchestrator**
+
+Replace `src/main/ipc/handlers.ts`:
+
+```ts
+import { BrowserWindow } from 'electron'
+import { CampaignStore } from '../storage/campaignStore'
+import { SettingsStore } from '../storage/settingsStore'
+import { ModelManager } from '../whisper/modelManager'
+import { registerSettingsHandlers } from './settingsHandlers'
+import { registerCampaignHandlers } from './campaignHandlers'
+import { registerSessionHandlers } from './sessionHandlers'
+import { registerSummaryHandlers } from './summaryHandlers'
+
+export function registerHandlers(
+  campaignStore: CampaignStore,
+  settingsStore: SettingsStore,
+  modelManager: ModelManager,
+  getWindow: () => BrowserWindow | null
+): void {
+  registerSettingsHandlers(settingsStore)
+  registerCampaignHandlers(campaignStore)
+  registerSessionHandlers(campaignStore, settingsStore, modelManager, getWindow)
+  registerSummaryHandlers(campaignStore, settingsStore)
+}
+```
+
+Note: `sessionHandlers.ts` contains the `session:start`, `session:stop`, `session:list`, `session:getEvents` handlers already written across Plans 2 and 3.
+
+- [ ] **Step 3: Run all tests to verify no breakage**
+
+```bash
+npx vitest run
+npm run build
+```
+
+Expected: All tests pass, clean build.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/main/ipc/
+git commit -m "refactor: split handlers.ts into domain handler files"
+```
+
+---
+
+### Task 12: Last session recap button (CEO cherry-pick)
+
+**Files:**
+- Create: `src/renderer/components/RecapModal.tsx`
+- Modify: `src/renderer/pages/Home.tsx`
+- Modify: `src/main/ipc/summaryHandlers.ts` — add `summary:lastSessionRecap` handler
+
+"Previously on your campaign..." — a 2-paragraph text recap shown at session start so the DM can read it aloud at the table. Visible only when prior sessions exist. Text display only (no TTS).
+
+- [ ] **Step 1: Add `summary:lastSessionRecap` IPC handler**
+
+Add to `src/main/ipc/summaryHandlers.ts`:
+
+```ts
+import fs from 'fs'
+import path from 'path'
+
+ipcMain.handle('summary:lastSessionRecap', async (_e, campaignId: string) => {
+  const settings = settingsStore.load()
+  const apiKey = await settingsStore.getSecret('claude-api-key')
+  if (!apiKey) throw new Error('Claude API key not configured.')
+
+  const campaign = campaignStore.loadCampaign(campaignId)
+  if (!campaign) throw new Error(`Campaign ${campaignId} not found`)
+
+  // Find most recent session
+  const sessionsDir = path.join(getBasePath(), 'campaigns', campaignId, 'sessions')
+  if (!fs.existsSync(sessionsDir)) throw new Error('No sessions recorded yet.')
+
+  const dbFiles = fs.readdirSync(sessionsDir)
+    .filter(f => f.endsWith('.db'))
+    .map(f => ({ file: f, mtime: fs.statSync(path.join(sessionsDir, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)
+
+  if (dbFiles.length === 0) throw new Error('No sessions recorded yet.')
+
+  const latestId = dbFiles[0].file.replace('.db', '')
+  const store = new SessionStore(getSessionPath(campaignId, latestId))
+  const events = store.getEvents(latestId)
+  store.close()
+
+  const Anthropic = (await import('@anthropic-ai/sdk')).default
+  const client = new Anthropic({ apiKey })
+
+  const structuredLog = buildStructuredLog(events, campaign.characters)
+  const prompt = `You are writing a "Previously on your campaign..." recap for a D&D group about to start their next session.
+
+Based on the session log below, write exactly 2 paragraphs summarizing the most important story events. Write in third person, past tense, dramatic tone. No preamble — start directly with "Previously..."
+
+SESSION LOG:
+${structuredLog || 'No events recorded.'}
+`
+
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 600,
+    messages: [{ role: 'user', content: prompt }]
+  })
+
+  return response.content[0].type === 'text' ? response.content[0].text : ''
+})
+```
+
+Add the import at top of summaryHandlers.ts: `import { buildStructuredLog } from '../summary/summaryPrompt'`
+
+- [ ] **Step 2: Add to preload**
+
+Add to `src/preload/index.ts` in the `summary` object:
+
+```ts
+lastSessionRecap: (campaignId: string) =>
+  ipcRenderer.invoke('summary:lastSessionRecap', campaignId)
+```
+
+- [ ] **Step 3: Add to renderer IPC wrapper**
+
+Add to `src/renderer/lib/ipc.ts` in `ipc.summary`:
+
+```ts
+lastSessionRecap: (campaignId: string): Promise<string> =>
+  api.summary.lastSessionRecap(campaignId)
+```
+
+- [ ] **Step 4: Create RecapModal**
+
+Create `src/renderer/components/RecapModal.tsx`:
+
+```tsx
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { ScrollArea } from '@/components/ui/scroll-area'
+
+interface Props {
+  open: boolean
+  recap: string
+  onClose: () => void
+}
+
+export default function RecapModal({ open, recap, onClose }: Props) {
+  return (
+    <Dialog open={open} onOpenChange={o => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Previously on your campaign...</DialogTitle>
+        </DialogHeader>
+        <ScrollArea className="max-h-80">
+          <p className="whitespace-pre-wrap text-sm leading-relaxed p-1">{recap}</p>
+        </ScrollArea>
+        <DialogFooter>
+          <Button onClick={onClose}>Close</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+```
+
+- [ ] **Step 5: Add recap button to Home page**
+
+In `src/renderer/pages/Home.tsx`, add state and button. Check if prior sessions exist before showing:
+
+```tsx
+// Add import:
+import RecapModal from '../components/RecapModal'
+import { BookOpen, Loader2 } from 'lucide-react'
+
+// Add state:
+const [recapLoading, setRecapLoading] = useState(false)
+const [recap, setRecap] = useState<string | null>(null)
+const [hasPriorSessions, setHasPriorSessions] = useState(false)
+
+// Add to useEffect (after loading campaignId):
+ipc.settings.load().then(async s => {
+  if (s.activeCampaignId) {
+    const sessions = await ipc.history.list(s.activeCampaignId)
+    setHasPriorSessions(sessions.length > 0)
+    setCampaignId(s.activeCampaignId)
+  }
+})
+
+// Handle recap button click:
+const handleRecap = async () => {
+  if (!campaignId) return
+  setRecapLoading(true)
+  try {
+    const text = await ipc.summary.lastSessionRecap(campaignId)
+    setRecap(text)
+  } catch (err) {
+    setErrorMessage((err as Error).message)
+  } finally {
+    setRecapLoading(false)
+  }
+}
+
+// Add to header row (only when prior sessions exist and no active session):
+{hasPriorSessions && !sessionActive && (
+  <Button variant="outline" onClick={handleRecap} disabled={recapLoading} className="gap-2">
+    {recapLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <BookOpen className="h-4 w-4" />}
+    Previously...
+  </Button>
+)}
+
+// Add RecapModal to JSX:
+<RecapModal open={!!recap} recap={recap ?? ''} onClose={() => setRecap(null)} />
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/renderer/components/RecapModal.tsx src/renderer/pages/Home.tsx src/main/ipc/summaryHandlers.ts src/preload/index.ts src/renderer/lib/ipc.ts
+git commit -m "feat: add last session recap button with 'Previously on your campaign...' modal"
+```
+
+---
+
+### Task 14: Run full test suite and push
 
 - [ ] **Step 1: Run all tests**
 
@@ -1172,6 +1572,29 @@ git push origin plans
 ```
 
 Expected: All 4 plan files on the `plans` branch pushed to GitHub.
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | resolved | Gaps applied; cherry-picks incorporated |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | resolved | 4 bugs fixed; Tasks 11 + 12 added |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+
+**FIXES APPLIED:**
+- Bug: `puppeteer` → `puppeteer-core` with Electron Chromium reuse — saves ~300 MB from installer (CEO perf concern)
+- Bug: Path traversal fix in `MarkdownOutput.validateFolder()` — resolves symlinks, rejects paths outside `os.homedir()` (CEO Gap 7)
+- Bug: `summary:generate` no longer hardcodes tone/length — reads from `settings.summaryTone` / `settings.summaryLength`
+- Bug: `AppSettings` model now includes `summaryTone` and `summaryLength` fields (updated in Plan 1 as well)
+- Added: `SummaryService` 300-event cap with 3-segment chunking + combine pass (CEO Gap 6)
+- Added: 4th test case for chunking path in SummaryService tests
+- Added: Task 11 — handlers.ts split into `settingsHandlers`, `campaignHandlers`, `sessionHandlers`, `summaryHandlers` (CEO Gap 5)
+- Added: Task 12 — "Previously on your campaign..." recap button with modal (CEO cherry-pick Plan 4)
+
+**VERDICT:** ENG REVIEW COMPLETE — all 4 plans ready for implementation.
 
 ---
 

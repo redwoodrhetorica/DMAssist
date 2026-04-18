@@ -93,6 +93,93 @@ git commit -m "feat: scaffold electron-vite react-ts project"
 
 ---
 
+### Task 1b: Configure Vitest for Electron
+
+**Files:**
+- Create: `vitest.config.ts`
+
+This is required before any tests will run. Without it, `vi.mock('electron', ...)` and `vi.mock('keytar', ...)` fail with module-not-found errors.
+
+- [ ] **Step 1: Create vitest.config.ts**
+
+Create `vitest.config.ts`:
+
+```ts
+import { defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    globals: true,
+    exclude: ['**/node_modules/**', '**/dist/**'],
+    // Prevent electron from actually launching during tests
+    alias: {
+      electron: new URL('./tests/__mocks__/electron.ts', import.meta.url).pathname
+    }
+  }
+})
+```
+
+- [ ] **Step 2: Create Electron stub module**
+
+Create `tests/__mocks__/electron.ts`:
+
+```ts
+import { vi } from 'vitest'
+
+export const app = {
+  getPath: vi.fn((name: string) => {
+    if (name === 'documents') return '/mock/home'
+    return `/mock/${name}`
+  }),
+  whenReady: vi.fn().mockResolvedValue(undefined),
+  on: vi.fn(),
+  quit: vi.fn()
+}
+
+export const ipcMain = {
+  handle: vi.fn(),
+  on: vi.fn(),
+  removeAllListeners: vi.fn()
+}
+
+export const BrowserWindow = vi.fn().mockImplementation(() => ({
+  loadURL: vi.fn(),
+  loadFile: vi.fn(),
+  webContents: { send: vi.fn() },
+  on: vi.fn()
+}))
+
+export const clipboard = {
+  writeText: vi.fn(),
+  readText: vi.fn().mockReturnValue('')
+}
+
+export const contextBridge = { exposeInMainWorld: vi.fn() }
+export const ipcRenderer = {
+  invoke: vi.fn(),
+  on: vi.fn(),
+  removeAllListeners: vi.fn()
+}
+```
+
+- [ ] **Step 3: Run existing tests to verify they now pass**
+
+```bash
+npx vitest run
+```
+
+Expected: Tests pass (or fail with "module not found" for modules not yet created — not with Electron import errors).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add vitest.config.ts tests/__mocks__/electron.ts
+git commit -m "test: add vitest config and electron stub for unit tests"
+```
+
+---
+
 ### Task 2: Install and configure shadcn/ui + Tailwind
 
 **Files:**
@@ -239,6 +326,7 @@ export interface Campaign {
   name: string
   createdAt: number
   characters: Character[]
+  metadata: Record<string, unknown>  // forward-allocated for Phase 2 lore pages
 }
 ```
 
@@ -291,6 +379,8 @@ export interface OutputSettings {
 export interface AppSettings {
   activeCampaignId?: string
   transcriptionQuality: TranscriptionQuality
+  summaryTone: CampaignTone
+  summaryLength: SummaryLength
   output: OutputSettings
   onboardingComplete: boolean
 }
@@ -832,6 +922,7 @@ Create `src/main/storage/settingsStore.ts`:
 
 ```ts
 import fs from 'fs'
+import path from 'path'
 import keytar from 'keytar'
 import { AppSettings } from '../models/settings'
 
@@ -839,6 +930,8 @@ const SERVICE_NAME = 'DMAssist'
 
 const defaults: AppSettings = {
   transcriptionQuality: 'good',
+  summaryTone: 'serious',
+  summaryLength: 'medium',
   onboardingComplete: false,
   output: {
     markdownEnabled: true,
@@ -857,7 +950,7 @@ export class SettingsStore {
   }
 
   save(settings: AppSettings): void {
-    fs.mkdirSync(require('path').dirname(this.filePath), { recursive: true })
+    fs.mkdirSync(path.dirname(this.filePath), { recursive: true })
     fs.writeFileSync(this.filePath, JSON.stringify(settings, null, 2), 'utf-8')
   }
 
@@ -1303,7 +1396,398 @@ git commit -m "feat: add React app shell with sidebar navigation"
 
 ---
 
-### Task 11: Run full test suite and push
+### Task 11: Whisper model download wizard (CEO cherry-pick)
+
+**Files:**
+- Create: `src/main/whisper/modelManager.ts`
+- Create: `src/main/ipc/modelHandlers.ts`
+- Create: `tests/main/whisper/modelManager.test.ts`
+
+Non-technical users must be guided through the one-time Whisper model download. This is a first-launch blocker: sessions cannot start until a model `.bin` file exists. Models are stored at `~/Documents/DMAssist/models/`.
+
+Model size: `ggml-base.bin` ~150 MB, `ggml-small.bin` ~460 MB, `ggml-medium.bin` ~1.5 GB.
+
+Quality setting → model mapping:
+- `good` → `ggml-base.bin`
+- `better` → `ggml-small.bin`
+- `best` → `ggml-medium.bin`
+
+**Note:** Hugging Face model URLs may not support `Accept-Ranges`. Implement resume as best-effort; fall back to full re-download if the server does not return `206 Partial Content`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/main/whisper/modelManager.test.ts`:
+
+```ts
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+import { ModelManager } from '../../../src/main/whisper/modelManager'
+
+let tmpDir: string
+let manager: ModelManager
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dmassist-'))
+  manager = new ModelManager(path.join(tmpDir, 'models'))
+})
+
+afterEach(() => {
+  fs.rmSync(tmpDir, { recursive: true })
+})
+
+describe('ModelManager', () => {
+  it('isModelPresent returns false when file does not exist', () => {
+    expect(manager.isModelPresent('good')).toBe(false)
+  })
+
+  it('isModelPresent returns true when model file exists', () => {
+    const modelsDir = path.join(tmpDir, 'models')
+    fs.mkdirSync(modelsDir, { recursive: true })
+    fs.writeFileSync(path.join(modelsDir, 'ggml-base.bin'), 'fake')
+    expect(manager.isModelPresent('good')).toBe(true)
+  })
+
+  it('getModelPath returns correct path for quality', () => {
+    expect(manager.getModelPath('good')).toContain('ggml-base.bin')
+    expect(manager.getModelPath('better')).toContain('ggml-small.bin')
+    expect(manager.getModelPath('best')).toContain('ggml-medium.bin')
+  })
+
+  it('getDiskRequiredMb returns correct values', () => {
+    expect(manager.getDiskRequiredMb('good')).toBe(150)
+    expect(manager.getDiskRequiredMb('better')).toBe(460)
+    expect(manager.getDiskRequiredMb('best')).toBe(1500)
+  })
+})
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+npx vitest run tests/main/whisper/modelManager.test.ts
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement ModelManager**
+
+Create `src/main/whisper/modelManager.ts`:
+
+```ts
+import fs from 'fs'
+import path from 'path'
+import https from 'https'
+import { TranscriptionQuality } from '../models/settings'
+
+const MODEL_FILES: Record<TranscriptionQuality, string> = {
+  good: 'ggml-base.bin',
+  better: 'ggml-small.bin',
+  best: 'ggml-medium.bin'
+}
+
+const MODEL_URLS: Record<TranscriptionQuality, string> = {
+  good: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
+  better: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
+  best: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin'
+}
+
+const DISK_REQUIRED_MB: Record<TranscriptionQuality, number> = {
+  good: 150,
+  better: 460,
+  best: 1500
+}
+
+export type DownloadProgress = { percent: number; bytesReceived: number; totalBytes: number }
+
+export class ModelManager {
+  constructor(private modelsDir: string) {}
+
+  isModelPresent(quality: TranscriptionQuality): boolean {
+    return fs.existsSync(this.getModelPath(quality))
+  }
+
+  getModelPath(quality: TranscriptionQuality): string {
+    return path.join(this.modelsDir, MODEL_FILES[quality])
+  }
+
+  getDiskRequiredMb(quality: TranscriptionQuality): number {
+    return DISK_REQUIRED_MB[quality]
+  }
+
+  async download(
+    quality: TranscriptionQuality,
+    onProgress: (progress: DownloadProgress) => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    fs.mkdirSync(this.modelsDir, { recursive: true })
+
+    const destPath = this.getModelPath(quality)
+    const tmpPath = destPath + '.tmp'
+    const url = MODEL_URLS[quality]
+
+    // Check for partial download (resume best-effort)
+    let startByte = 0
+    if (fs.existsSync(tmpPath)) {
+      startByte = fs.statSync(tmpPath).size
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const headers: Record<string, string> = {}
+      if (startByte > 0) headers['Range'] = `bytes=${startByte}-`
+
+      const req = https.get(url, { headers }, (res) => {
+        // If server doesn't support range requests, restart from 0
+        if (res.statusCode === 416 || (startByte > 0 && res.statusCode === 200)) {
+          fs.rmSync(tmpPath, { force: true })
+          startByte = 0
+        }
+
+        if (res.statusCode !== 200 && res.statusCode !== 206) {
+          reject(new Error(`Download failed: HTTP ${res.statusCode}`))
+          return
+        }
+
+        const totalBytes = parseInt(res.headers['content-length'] ?? '0', 10) + startByte
+        let bytesReceived = startByte
+        const writeStream = fs.createWriteStream(tmpPath, { flags: startByte > 0 ? 'a' : 'w' })
+
+        res.on('data', (chunk: Buffer) => {
+          if (signal?.aborted) { req.destroy(); writeStream.destroy(); return }
+          bytesReceived += chunk.length
+          const percent = totalBytes > 0 ? Math.round((bytesReceived / totalBytes) * 100) : 0
+          onProgress({ percent, bytesReceived, totalBytes })
+        })
+
+        res.pipe(writeStream)
+        writeStream.on('finish', () => {
+          fs.renameSync(tmpPath, destPath)
+          resolve()
+        })
+        writeStream.on('error', reject)
+      })
+
+      req.on('error', reject)
+      signal?.addEventListener('abort', () => req.destroy())
+    })
+  }
+
+  cancelAndCleanPartial(quality: TranscriptionQuality): void {
+    const tmpPath = this.getModelPath(quality) + '.tmp'
+    fs.rmSync(tmpPath, { force: true })
+  }
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+npx vitest run tests/main/whisper/modelManager.test.ts
+```
+
+Expected: PASS — 4 tests passing.
+
+- [ ] **Step 5: Add model IPC handlers**
+
+Create `src/main/ipc/modelHandlers.ts`:
+
+```ts
+import { ipcMain } from 'electron'
+import { ModelManager, DownloadProgress } from '../whisper/modelManager'
+import { TranscriptionQuality } from '../models/settings'
+
+export function registerModelHandlers(
+  modelManager: ModelManager,
+  getWindow: () => Electron.BrowserWindow | null
+): void {
+  let activeAbortController: AbortController | null = null
+
+  ipcMain.handle('model:isPresent', (_e, quality: TranscriptionQuality) =>
+    modelManager.isModelPresent(quality))
+
+  ipcMain.handle('model:getPath', (_e, quality: TranscriptionQuality) =>
+    modelManager.getModelPath(quality))
+
+  ipcMain.handle('model:download', async (_e, quality: TranscriptionQuality) => {
+    activeAbortController = new AbortController()
+
+    try {
+      await modelManager.download(
+        quality,
+        (progress: DownloadProgress) => {
+          getWindow()?.webContents.send('model:progress', progress)
+        },
+        activeAbortController.signal
+      )
+      getWindow()?.webContents.send('model:complete', quality)
+    } catch (err) {
+      if (!activeAbortController.signal.aborted) {
+        getWindow()?.webContents.send('model:error', (err as Error).message)
+      }
+    } finally {
+      activeAbortController = null
+    }
+  })
+
+  ipcMain.handle('model:cancel', (_e, quality: TranscriptionQuality) => {
+    activeAbortController?.abort()
+    activeAbortController = null
+  })
+}
+```
+
+- [ ] **Step 6: Wire model handlers into main process**
+
+In `src/main/index.ts`, import and register model handlers alongside existing handlers:
+
+```ts
+import { ModelManager } from './whisper/modelManager'
+import { registerModelHandlers } from './ipc/modelHandlers'
+import path from 'path'
+
+// In app.whenReady():
+const modelsDir = path.join(getBasePath(), 'models')
+const modelManager = new ModelManager(modelsDir)
+registerModelHandlers(modelManager, () => win)
+```
+
+- [ ] **Step 7: Add model channels to preload**
+
+Add to preload `src/preload/index.ts` api object:
+
+```ts
+model: {
+  isPresent: (quality: string) => ipcRenderer.invoke('model:isPresent', quality),
+  getPath: (quality: string) => ipcRenderer.invoke('model:getPath', quality),
+  download: (quality: string) => ipcRenderer.invoke('model:download', quality),
+  cancel: (quality: string) => ipcRenderer.invoke('model:cancel', quality),
+  onProgress: (cb: (p: unknown) => void) => {
+    ipcRenderer.on('model:progress', (_e, p) => cb(p))
+    return () => ipcRenderer.removeAllListeners('model:progress')
+  },
+  onComplete: (cb: (quality: string) => void) => {
+    ipcRenderer.on('model:complete', (_e, q) => cb(q))
+    return () => ipcRenderer.removeAllListeners('model:complete')
+  },
+  onError: (cb: (msg: string) => void) => {
+    ipcRenderer.on('model:error', (_e, msg) => cb(msg))
+    return () => ipcRenderer.removeAllListeners('model:error')
+  }
+}
+```
+
+- [ ] **Step 8: Add model IPC wrapper to renderer**
+
+Add to `src/renderer/lib/ipc.ts`:
+
+```ts
+import { DownloadProgress } from '../../main/whisper/modelManager'
+import { TranscriptionQuality } from '../../main/models/settings'
+
+// Add to ipc object:
+model: {
+  isPresent: (quality: TranscriptionQuality): Promise<boolean> => api.model.isPresent(quality),
+  getPath: (quality: TranscriptionQuality): Promise<string> => api.model.getPath(quality),
+  download: (quality: TranscriptionQuality): Promise<void> => api.model.download(quality),
+  cancel: (quality: TranscriptionQuality): Promise<void> => api.model.cancel(quality),
+  onProgress: (cb: (p: DownloadProgress) => void): (() => void) => api.model.onProgress(cb),
+  onComplete: (cb: (quality: TranscriptionQuality) => void): (() => void) => api.model.onComplete(cb),
+  onError: (cb: (msg: string) => void): (() => void) => api.model.onError(cb)
+}
+```
+
+- [ ] **Step 9: Create ModelSetup UI component**
+
+Create `src/renderer/components/ModelSetup.tsx`:
+
+```tsx
+import { useState, useEffect } from 'react'
+import { Button } from '@/components/ui/button'
+import { Progress } from '@/components/ui/progress'
+import { ipc } from '../lib/ipc'
+import { TranscriptionQuality } from '../../main/models/settings'
+
+interface Props {
+  quality: TranscriptionQuality
+  onReady: () => void
+}
+
+export default function ModelSetup({ quality, onReady }: Props) {
+  const [progress, setProgress] = useState(0)
+  const [downloading, setDownloading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    const cleanupProgress = ipc.model.onProgress(p => setProgress(p.percent))
+    const cleanupComplete = ipc.model.onComplete(() => { setDownloading(false); onReady() })
+    const cleanupError = ipc.model.onError(msg => { setDownloading(false); setError(msg) })
+    return () => { cleanupProgress(); cleanupComplete(); cleanupError() }
+  }, [onReady])
+
+  const handleDownload = async () => {
+    setError(null)
+    setProgress(0)
+    setDownloading(true)
+    await ipc.model.download(quality)
+  }
+
+  const sizeMap: Record<TranscriptionQuality, string> = { good: '~150 MB', better: '~460 MB', best: '~1.5 GB' }
+
+  return (
+    <div className="flex flex-col gap-4 p-6 max-w-md">
+      <h2 className="text-lg font-semibold">One-time Setup</h2>
+      <p className="text-sm text-muted-foreground">
+        DM Assistant uses a local AI model to transcribe speech. You need to download it once ({sizeMap[quality]}).
+        No audio ever leaves your computer.
+      </p>
+      {error && (
+        <p className="text-sm text-destructive">{error}</p>
+      )}
+      {downloading ? (
+        <div className="flex flex-col gap-2">
+          <Progress value={progress} className="h-2" />
+          <p className="text-xs text-muted-foreground text-right">{progress}%</p>
+          <Button variant="outline" onClick={() => ipc.model.cancel(quality)} size="sm" className="w-fit">
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <Button onClick={handleDownload}>
+          {error ? 'Retry Download' : 'Download Transcription Model'}
+        </Button>
+      )}
+    </div>
+  )
+}
+```
+
+Add required shadcn component first: `npx shadcn@latest add progress`
+
+- [ ] **Step 10: Gate session start behind model presence check**
+
+In `src/main/ipc/handlers.ts`, in the `session:start` handler, add a pre-flight check before creating the pipeline:
+
+```ts
+// After loading settings, before creating the pipeline:
+const modelPath = modelManager.getModelPath(settings.transcriptionQuality)
+if (!modelManager.isModelPresent(settings.transcriptionQuality)) {
+  throw new Error('Whisper model not downloaded. Open the app to complete setup.')
+}
+```
+
+Pass `modelManager` into `registerHandlers()` (update signature).
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/main/whisper/ src/main/ipc/modelHandlers.ts src/renderer/components/ModelSetup.tsx tests/main/whisper/
+git commit -m "feat: add Whisper model download wizard with resume and progress"
+```
+
+---
+
+### Task 13: Run full test suite and push
 
 - [ ] **Step 1: Run all tests**
 
@@ -1333,11 +1817,15 @@ Expected: Branch pushed to GitHub.
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | issues_open | 6 proposals, 6 accepted, 4 deferred; 8 critical gaps identified |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | resolved | 6 proposals, 6 accepted, 4 deferred; 8 critical gaps identified |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | resolved | 3 bugs fixed; Task 1b (Vitest config) + Task 11 (Whisper wizard) added |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 
-**UNRESOLVED:** 3 reviewer concerns (HTTP Range resume assumption, error buffer persistence, release ownership — see CEO plan)
+**FIXES APPLIED:**
+- Bug: `require('path')` replaced with ES import in settingsStore
+- Bug: `metadata: {}` added to Campaign model (CEO cherry-pick)
+- Added: Task 1b — Vitest config + Electron stub (blocked all tests without this)
+- Added: Task 11 — Whisper model download wizard with progress, resume, cancel, and ModelSetup UI
 
-**VERDICT:** CEO REVIEW COMPLETE (issues_open) — eng review required before implementation.
+**VERDICT:** ENG REVIEW COMPLETE — plan ready for implementation.

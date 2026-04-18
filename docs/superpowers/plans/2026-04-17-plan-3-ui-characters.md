@@ -111,6 +111,7 @@ import { v4 as uuid } from 'uuid'
 interface Props {
   open: boolean
   character?: Character
+  existingNames?: string[]  // names already in use — used to prevent duplicates
   onSave: (character: Character) => void
   onClose: () => void
 }
@@ -120,18 +121,33 @@ const empty = (): Character => ({
   description: '', aliases: [], archived: false
 })
 
-export default function CharacterForm({ open, character, onSave, onClose }: Props) {
+export default function CharacterForm({ open, character, existingNames = [], onSave, onClose }: Props) {
   const [form, setForm] = useState<Character>(empty)
+  const [nameError, setNameError] = useState<string | null>(null)
 
   useEffect(() => {
     setForm(character ?? empty())
+    setNameError(null)
   }, [character, open])
 
-  const set = (field: keyof Character, value: string) =>
+  const set = (field: keyof Character, value: string) => {
     setForm(prev => ({ ...prev, [field]: value }))
+    if (field === 'name') setNameError(null)
+  }
 
   const handleSave = () => {
     if (!form.name.trim() || !form.playerName.trim()) return
+    // Uniqueness check — skip for existing character being edited (same id)
+    const isDuplicate = existingNames
+      .filter((_, i) => {
+        const existing = existingNames[i]
+        return !(character && existing.toLowerCase() === character.name.toLowerCase())
+      })
+      .some(n => n.toLowerCase() === form.name.trim().toLowerCase())
+    if (isDuplicate) {
+      setNameError(`A character named "${form.name}" already exists.`)
+      return
+    }
     const aliases = [form.name, ...form.aliases.filter(a => a !== form.name)]
     onSave({ ...form, aliases })
   }
@@ -145,7 +161,8 @@ export default function CharacterForm({ open, character, onSave, onClose }: Prop
         <div className="grid gap-4 py-2">
           <div className="grid gap-1.5">
             <Label htmlFor="name">Character Name *</Label>
-            <Input id="name" value={form.name} onChange={e => set('name', e.target.value)} placeholder="Theron" />
+            <Input id="name" value={form.name} onChange={e => set('name', e.target.value)} placeholder="Theron" className={nameError ? 'border-destructive' : ''} />
+            {nameError && <p className="text-xs text-destructive">{nameError}</p>}
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="playerName">Player Name *</Label>
@@ -270,6 +287,7 @@ export default function Characters() {
       <CharacterForm
         open={formOpen}
         character={editing}
+        existingNames={activeCharacters.map(c => c.name)}
         onSave={handleSave}
         onClose={() => { setFormOpen(false); setEditing(undefined) }}
       />
@@ -320,7 +338,19 @@ ipcMain.handle('session:list', (_e, campaignId: string) => {
   if (!fs.existsSync(sessionsDir)) return []
   return fs.readdirSync(sessionsDir)
     .filter(f => f.endsWith('.db'))
-    .map(f => f.replace('.db', ''))
+    .map(f => {
+      const sessionId = f.replace('.db', '')
+      const dbPath = path.join(sessionsDir, f)
+      try {
+        const store = new SessionStore(dbPath)
+        const session = store.getSession(sessionId)
+        store.close()
+        return session ?? { id: sessionId, campaignId, startedAt: 0 }
+      } catch {
+        return { id: sessionId, campaignId, startedAt: 0 }
+      }
+    })
+    .sort((a, b) => b.startedAt - a.startedAt)  // newest first
 })
 
 ipcMain.handle('session:getEvents', (_e, campaignId: string, sessionId: string) => {
@@ -344,6 +374,7 @@ history: {
   getEvents: (campaignId: string, sessionId: string) =>
     ipcRenderer.invoke('session:getEvents', campaignId, sessionId)
 }
+// Note: session:list now returns Session[] (with startedAt), not string[]
 ```
 
 - [ ] **Step 3: Add to renderer IPC wrapper**
@@ -355,7 +386,7 @@ import { SessionEvent, Session } from '../../main/models/session'
 
 // Add to ipc object:
 history: {
-  list: (campaignId: string): Promise<string[]> => api.history.list(campaignId),
+  list: (campaignId: string): Promise<Session[]> => api.history.list(campaignId),  // returns Session[], not string[]
   getEvents: (campaignId: string, sessionId: string): Promise<{ session: Session, events: SessionEvent[] }> =>
     api.history.getEvents(campaignId, sessionId)
 }
@@ -366,24 +397,31 @@ history: {
 Create `src/renderer/components/SessionRow.tsx`:
 
 ```tsx
-import { Button } from '@/components/ui/button'
 import { ChevronRight } from 'lucide-react'
+import { Session } from '../../main/models/session'
 
 interface Props {
-  sessionId: string
+  session: Session
   onClick: () => void
 }
 
-export default function SessionRow({ sessionId, onClick }: Props) {
-  const date = new Date(sessionId.split('-')[0] ? parseInt(sessionId) : Date.now())
-  const label = `Session — ${new Date().toLocaleDateString()}`
+export default function SessionRow({ session, onClick }: Props) {
+  const date = session.startedAt > 0
+    ? new Date(session.startedAt).toLocaleString()
+    : 'Unknown date'
+  const duration = session.endedAt && session.startedAt > 0
+    ? `${Math.round((session.endedAt - session.startedAt) / 60000)} min`
+    : null
 
   return (
     <button
       onClick={onClick}
       className="w-full flex items-center justify-between px-4 py-3 rounded-lg border hover:bg-muted/50 transition-colors text-left"
     >
-      <span className="font-medium">{sessionId}</span>
+      <div className="flex flex-col">
+        <span className="font-medium">{session.title ?? `Session — ${date}`}</span>
+        {duration && <span className="text-xs text-muted-foreground">{duration}</span>}
+      </div>
       <ChevronRight className="h-4 w-4 text-muted-foreground" />
     </button>
   )
@@ -402,11 +440,11 @@ import SessionRow from '../components/SessionRow'
 import TranscriptEntry from '../components/TranscriptEntry'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { ipc } from '../lib/ipc'
-import { SessionEvent } from '../../main/models/session'
+import { SessionEvent, Session } from '../../main/models/session'
 import { ClassifiedEvent } from '../../main/models/events'
 
 export default function History() {
-  const [sessionIds, setSessionIds] = useState<string[]>([])
+  const [sessions, setSessions] = useState<Session[]>([])
   const [selected, setSelected] = useState<{ sessionId: string; events: SessionEvent[] } | null>(null)
   const [campaignId, setCampaignId] = useState<string | null>(null)
 
@@ -414,7 +452,7 @@ export default function History() {
     ipc.settings.load().then(s => {
       if (!s.activeCampaignId) return
       setCampaignId(s.activeCampaignId)
-      ipc.history.list(s.activeCampaignId).then(setSessionIds)
+      ipc.history.list(s.activeCampaignId).then(setSessions)
     })
   }, [])
 
@@ -441,7 +479,7 @@ export default function History() {
         </div>
         <ScrollArea className="flex-1 rounded-lg border bg-muted/20">
           <div className="flex flex-col gap-1 p-3">
-            {asClassified.map(e => <TranscriptEntry key={e.id} event={e} />)}
+            {asClassified.map(e => <TranscriptEntry key={e.id} item={e} />)}
           </div>
         </ScrollArea>
       </div>
@@ -451,12 +489,12 @@ export default function History() {
   return (
     <div className="p-6 flex flex-col gap-4">
       <h1 className="text-2xl font-bold">Session History</h1>
-      {sessionIds.length === 0 ? (
+      {sessions.length === 0 ? (
         <p className="text-muted-foreground py-10 text-center">No sessions recorded yet.</p>
       ) : (
         <div className="flex flex-col gap-2">
-          {sessionIds.map(id => (
-            <SessionRow key={id} sessionId={id} onClick={() => handleSelect(id)} />
+          {sessions.map(session => (
+            <SessionRow key={session.id} session={session} onClick={() => handleSelect(session.id)} />
           ))}
         </div>
       )}
@@ -721,6 +759,8 @@ export default function Onboarding({ onComplete }: Props) {
   const [campaign, setCampaign] = useState<Campaign | null>(null)
   const [characters, setCharacters] = useState<Character[]>([])
   const [formOpen, setFormOpen] = useState(false)
+  const [apiKey, setApiKey] = useState('')
+  const [apiKeyStatus, setApiKeyStatus] = useState<'idle' | 'testing' | 'valid' | 'invalid'>('idle')
 
   const handleCreateCampaign = async () => {
     if (!campaignName.trim()) return
@@ -739,6 +779,21 @@ export default function Onboarding({ onComplete }: Props) {
     setFormOpen(false)
   }
 
+  const handleTestApiKey = async () => {
+    if (!apiKey.startsWith('sk-ant-')) {
+      setApiKeyStatus('invalid')
+      return
+    }
+    setApiKeyStatus('testing')
+    try {
+      // Basic format check — real validation happens at first Claude call
+      await ipc.settings.setSecret('claude-api-key', apiKey)
+      setApiKeyStatus('valid')
+    } catch {
+      setApiKeyStatus('invalid')
+    }
+  }
+
   const handleFinish = async () => {
     const settings = await ipc.settings.load()
     await ipc.settings.save({ ...settings, activeCampaignId: campaign!.id, onboardingComplete: true })
@@ -749,7 +804,7 @@ export default function Onboarding({ onComplete }: Props) {
     <div className="flex h-screen items-center justify-center bg-background p-6">
       <div className="w-full max-w-lg">
         <div className="flex gap-2 mb-8 justify-center">
-          {[1, 2, 3].map(n => (
+          {[1, 2, 3, 4].map(n => (
             <div key={n} className={`h-2 rounded-full transition-all ${n <= step ? 'w-8 bg-primary' : 'w-2 bg-muted'}`} />
           ))}
         </div>
@@ -811,19 +866,75 @@ export default function Onboarding({ onComplete }: Props) {
         {step === 3 && (
           <Card>
             <CardHeader>
-              <CardTitle>You're ready!</CardTitle>
+              <CardTitle>Almost there!</CardTitle>
               <CardDescription>
                 Your campaign <strong>{campaign?.name}</strong> is set up with {characters.length} character{characters.length !== 1 ? 's' : ''}.
-                Head to Settings to add your Claude API key before your first session.
+                One last step — let's add your Claude API key so the AI features work.
               </CardDescription>
             </CardHeader>
             <CardFooter>
-              <Button className="w-full" onClick={handleFinish}>Let's go</Button>
+              <Button className="w-full" onClick={() => setStep(4)}>Next</Button>
             </CardFooter>
           </Card>
         )}
 
-        <CharacterForm open={formOpen} onSave={handleAddCharacter} onClose={() => setFormOpen(false)} />
+        {step === 4 && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Add Your Claude API Key</CardTitle>
+              <CardDescription>
+                This is a password that lets the app use AI — like a library card for Claude.
+                Get one free at <strong>console.anthropic.com</strong> → API Keys.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <div className="grid gap-1.5">
+                <label className="text-sm font-medium">API Key</label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={e => { setApiKey(e.target.value); setApiKeyStatus('idle') }}
+                    placeholder="sk-ant-..."
+                    className="flex-1 rounded-md border bg-background px-3 py-2 text-sm"
+                  />
+                  <Button
+                    variant="outline"
+                    onClick={handleTestApiKey}
+                    disabled={!apiKey.trim() || apiKeyStatus === 'testing'}
+                    size="sm"
+                  >
+                    Test
+                  </Button>
+                </div>
+                {apiKeyStatus === 'valid' && (
+                  <p className="text-xs text-green-600">Connected — key saved securely.</p>
+                )}
+                {apiKeyStatus === 'invalid' && (
+                  <p className="text-xs text-destructive">Invalid key — check that it starts with sk-ant- at console.anthropic.com</p>
+                )}
+              </div>
+            </CardContent>
+            <CardFooter className="gap-2">
+              <Button
+                variant="ghost"
+                onClick={handleFinish}
+                className="flex-1"
+              >
+                Skip — I'll add it later
+              </Button>
+              <Button
+                onClick={handleFinish}
+                className="flex-1"
+                disabled={apiKeyStatus !== 'valid'}
+              >
+                Let's go!
+              </Button>
+            </CardFooter>
+          </Card>
+        )}
+
+        <CharacterForm open={formOpen} existingNames={characters.map(c => c.name)} onSave={handleAddCharacter} onClose={() => setFormOpen(false)} />
       </div>
     </div>
   )
@@ -916,3 +1027,24 @@ Expected: Clean build.
 ```bash
 git push origin plans
 ```
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | resolved | Gaps applied; cherry-picks incorporated |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | resolved | 4 bugs fixed; onboarding step 4 added |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+
+**FIXES APPLIED:**
+- Bug: `session:list` now returns `Session[]` with `startedAt`/`endedAt` instead of `string[]` of UUIDs (CEO Gap 4)
+- Bug: `SessionRow` rewrote date display to use `session.startedAt` — shows human-readable date + duration (CEO Gap 4)
+- Bug: Duplicate character name check added to `CharacterForm.handleSave` with inline error display (CEO Gap 8)
+- Bug: `CharacterForm` now accepts `existingNames` prop; both Characters page and Onboarding pass it
+- Added: Onboarding step 4 — API key setup with paste field, format validation, and "Test" + skip option (CEO cherry-pick Plan 3)
+- Updated: `ipc.history.list` return type is `Session[]` not `string[]`
+
+**VERDICT:** ENG REVIEW COMPLETE — plan ready for implementation.

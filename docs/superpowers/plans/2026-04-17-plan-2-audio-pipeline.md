@@ -170,9 +170,17 @@ export class LocalMicPlugin implements InputPlugin {
 
   async start(bus: EventBus): Promise<void> {
     this.bus = bus
-    const naudiodon = (await import('naudiodon')).default
+    let naudiodon: any
+    try {
+      naudiodon = (await import('naudiodon')).default
+    } catch (err) {
+      bus.emit('error', new Error('Microphone not found. Check your system settings.'))
+      throw err
+    }
 
-    this.audioStream = new naudiodon.AudioIO({
+    let audioIO: any
+    try {
+      audioIO = new naudiodon.AudioIO({
       inOptions: {
         channelCount: 1,
         sampleFormat: naudiodon.SampleFormat16Bit,
@@ -180,7 +188,13 @@ export class LocalMicPlugin implements InputPlugin {
         deviceId: this.config.deviceId ?? -1,
         closeOnError: false
       }
-    })
+      })
+    } catch (err) {
+      bus.emit('error', new Error('Microphone not found. Check your system settings.'))
+      throw err
+    }
+
+    this.audioStream = audioIO
 
     this.audioStream.on('data', (chunk: Buffer) => {
       this.buffer.push(chunk)
@@ -188,7 +202,7 @@ export class LocalMicPlugin implements InputPlugin {
     })
 
     this.audioStream.on('error', (err: Error) => {
-      bus.emit('error', err)
+      bus.emit('error', new Error('Microphone not found. Check your system settings.'))
     })
 
     this.audioStream.start()
@@ -812,6 +826,7 @@ import { CampaignStore } from '../storage/campaignStore'
 import { SettingsStore } from '../storage/settingsStore'
 import { SessionPipeline } from '../pipeline/sessionPipeline'
 import { LocalMicPlugin } from '../plugins/localMicPlugin'
+import { ModelManager } from '../whisper/modelManager'
 import { Campaign, Character } from '../models/campaign'
 import { AppSettings } from '../models/settings'
 import { getSessionPath } from '../storage/paths'
@@ -823,6 +838,7 @@ let activePipeline: SessionPipeline | null = null
 export function registerHandlers(
   campaignStore: CampaignStore,
   settingsStore: SettingsStore,
+  modelManager: ModelManager,
   getWindow: () => BrowserWindow | null
 ): void {
   // --- existing handlers (settings, campaign, character) remain unchanged ---
@@ -844,7 +860,13 @@ export function registerHandlers(
 
     const settings = settingsStore.load()
     const apiKey = await settingsStore.getSecret('claude-api-key')
-    if (!apiKey) throw new Error('Claude API key not configured')
+    if (!apiKey) throw new Error('Claude API key not configured. Add it in Settings.')
+
+    // Fail fast before starting mic — model must be present
+    if (!modelManager.isModelPresent(settings.transcriptionQuality)) {
+      throw new Error('Whisper model not downloaded. Complete setup before starting a session.')
+    }
+    const modelPath = modelManager.getModelPath(settings.transcriptionQuality)
 
     const campaign = campaignStore.loadCampaign(campaignId)
     if (!campaign) throw new Error(`Campaign ${campaignId} not found`)
@@ -855,10 +877,15 @@ export function registerHandlers(
     const { EventBus } = await import('../eventBus')
     const bus = new EventBus()
 
+    // Wire error events to renderer so silent crashes surface in the UI
+    bus.on('error', (err: Error) => {
+      getWindow()?.webContents.send('session:error', err.message)
+    })
+
     activePipeline = new SessionPipeline({
       bus,
       dbPath,
-      modelPath: settings.transcriptionQuality,
+      modelPath,
       apiKey,
       campaignId,
       characters: campaign.characters
@@ -894,6 +921,10 @@ session: {
   onEvent: (cb: (event: unknown) => void) => {
     ipcRenderer.on('session:event', (_e, event) => cb(event))
     return () => ipcRenderer.removeAllListeners('session:event')
+  },
+  onError: (cb: (message: string) => void) => {
+    ipcRenderer.on('session:error', (_e, msg) => cb(msg))
+    return () => ipcRenderer.removeAllListeners('session:error')
   }
 }
 ```
@@ -910,7 +941,9 @@ session: {
   start: (campaignId: string): Promise<string> => api.session.start(campaignId),
   stop: (): Promise<void> => api.session.stop(),
   onEvent: (cb: (event: ClassifiedEvent) => void): (() => void) =>
-    api.session.onEvent(cb)
+    api.session.onEvent(cb),
+  onError: (cb: (message: string) => void): (() => void) =>
+    api.session.onError(cb)
 }
 ```
 
@@ -1100,7 +1133,274 @@ git commit -m "feat: add live transcript UI with start/stop session control"
 
 ---
 
-### Task 8: Run full test suite and push
+### Task 8: Two-stage live transcript + error display (CEO cherry-picks)
+
+**Files:**
+- Modify: `src/renderer/components/TranscriptEntry.tsx` — add PENDING state
+- Modify: `src/renderer/components/LiveTranscript.tsx` — manage pending entries
+- Modify: `src/renderer/pages/Home.tsx` — wire error channel
+
+Two-stage state machine:
+```
+audio captured → Whisper transcribes → show as PENDING (gray, spinner icon)
+     ↓
+Claude classifies → update in-place to CLASSIFIED (color-coded by type)
+     ↓ (if classify fails OR >5s elapsed after Whisper completes)
+show as UNCLASSIFIED (yellow, flagged) — never disappears
+```
+
+PENDING entries are NOT persisted to SQLite. If the app crashes between Whisper completing and Claude responding, those entries are lost. This is acceptable for v1.
+
+SLA: 3s measured from when Whisper completes. If >5s elapsed, mark UNCLASSIFIED.
+
+- [ ] **Step 1: Add a `session:transcribed` IPC push from SessionPipeline**
+
+In `src/main/pipeline/sessionPipeline.ts`, add a callback for transcribed events (before classification):
+
+```ts
+// Add to SessionPipelineConfig:
+onTranscribed?: (event: TranscribedEvent) => void
+onClassified?: (event: ClassifiedEvent) => void
+
+// In the raw event handler, after transcription succeeds, before classify():
+this.config.onTranscribed?.(transcribed)
+```
+
+In `src/main/ipc/handlers.ts`, wire the new callback:
+
+```ts
+activePipeline.config.onTranscribed = (event) => {
+  getWindow()?.webContents.send('session:transcribed', event)
+}
+activePipeline.onClassified = (event) => {
+  getWindow()?.webContents.send('session:event', event)
+}
+```
+
+Add `session:transcribed` to preload:
+
+```ts
+onTranscribed: (cb: (event: unknown) => void) => {
+  ipcRenderer.on('session:transcribed', (_e, event) => cb(event))
+  return () => ipcRenderer.removeAllListeners('session:transcribed')
+}
+```
+
+Add to renderer IPC wrapper:
+
+```ts
+import { TranscribedEvent } from '../../main/models/events'
+
+onTranscribed: (cb: (event: TranscribedEvent) => void): (() => void) =>
+  api.session.onTranscribed(cb)
+```
+
+- [ ] **Step 2: Add pending entry type to TranscriptEntry**
+
+Update `src/renderer/components/TranscriptEntry.tsx`:
+
+```tsx
+import { Badge } from '@/components/ui/badge'
+import { Loader2 } from 'lucide-react'
+import { ClassifiedEvent, TranscribedEvent } from '../../main/models/events'
+import { cn } from '@/lib/utils'
+
+export type PendingEntry = { id: string; timestamp: number; text: string; status: 'pending' | 'unclassified' }
+export type TranscriptItem = ClassifiedEvent | PendingEntry
+
+function isPending(item: TranscriptItem): item is PendingEntry {
+  return 'status' in item
+}
+
+interface Props { item: TranscriptItem }
+
+const typeColors: Record<string, string> = {
+  dialogue: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+  action: 'bg-green-500/10 text-green-400 border-green-500/20',
+  combat: 'bg-red-500/10 text-red-400 border-red-500/20',
+  ooc: 'bg-muted text-muted-foreground border-muted',
+  meta: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+  unclassified: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20'
+}
+
+export default function TranscriptEntry({ item }: Props) {
+  const time = new Date(item.timestamp).toLocaleTimeString()
+
+  if (isPending(item)) {
+    return (
+      <div className={cn(
+        'flex gap-3 py-2 px-3 rounded-md text-sm',
+        item.status === 'unclassified' ? 'border border-yellow-500/30' : 'opacity-50'
+      )}>
+        <span className="text-muted-foreground w-16 shrink-0">{time}</span>
+        {item.status === 'pending'
+          ? <Loader2 className="h-4 w-4 animate-spin shrink-0 mt-0.5 text-muted-foreground" />
+          : <Badge variant="outline" className={typeColors.unclassified}>unclassified</Badge>
+        }
+        <span className="text-muted-foreground">{item.text}</span>
+      </div>
+    )
+  }
+
+  const speaker = item.characterId ? item.text : (item.playerName ?? 'Unknown')
+  return (
+    <div className={cn('flex gap-3 py-2 px-3 rounded-md text-sm', item.flagged && 'opacity-60 border border-dashed border-muted')}>
+      <span className="text-muted-foreground w-16 shrink-0">{time}</span>
+      <Badge variant="outline" className={cn('shrink-0 text-xs', typeColors[item.eventType])}>
+        {item.eventType}
+      </Badge>
+      <span className="font-medium shrink-0">{speaker}</span>
+      <span className="text-muted-foreground">{item.text}</span>
+    </div>
+  )
+}
+```
+
+- [ ] **Step 3: Update LiveTranscript to manage pending→classified transitions**
+
+Replace `src/renderer/components/LiveTranscript.tsx`:
+
+```tsx
+import { useEffect, useRef } from 'react'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import TranscriptEntry, { TranscriptItem } from './TranscriptEntry'
+
+interface Props { items: TranscriptItem[] }
+
+export default function LiveTranscript({ items }: Props) {
+  const bottomRef = useRef<HTMLDivElement>(null)
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [items.length])
+
+  if (items.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center text-muted-foreground text-sm">
+        Session events will appear here
+      </div>
+    )
+  }
+
+  return (
+    <ScrollArea className="h-full">
+      <div className="flex flex-col gap-1 p-3">
+        {items.map(item => <TranscriptEntry key={item.id} item={item} />)}
+        <div ref={bottomRef} />
+      </div>
+    </ScrollArea>
+  )
+}
+```
+
+- [ ] **Step 4: Update Home page to manage two-stage state and error toasts**
+
+Replace `src/renderer/pages/Home.tsx`:
+
+```tsx
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { Button } from '@/components/ui/button'
+import { Mic, MicOff, AlertCircle } from 'lucide-react'
+import LiveTranscript from '../components/LiveTranscript'
+import { TranscriptItem, PendingEntry } from '../components/TranscriptEntry'
+import { ipc } from '../lib/ipc'
+import { ClassifiedEvent } from '../../main/models/events'
+
+const CLASSIFY_TIMEOUT_MS = 5000
+
+export default function Home() {
+  const [sessionActive, setSessionActive] = useState(false)
+  const [items, setItems] = useState<TranscriptItem[]>([])
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [campaignId, setCampaignId] = useState<string | null>(null)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const timeoutsRef = useRef<Map<string, NodeJS.Timeout>>(new Map())
+
+  useEffect(() => {
+    ipc.settings.load().then(s => setCampaignId(s.activeCampaignId ?? null))
+
+    const cleanupEvent = ipc.session.onEvent((classified: ClassifiedEvent) => {
+      // Clear timeout and replace pending entry with classified
+      const timer = timeoutsRef.current.get(classified.id)
+      if (timer) { clearTimeout(timer); timeoutsRef.current.delete(classified.id) }
+      setItems(prev => prev.map(item => item.id === classified.id ? classified : item))
+    })
+
+    const cleanupTranscribed = ipc.session.onTranscribed((transcribed) => {
+      const pending: PendingEntry = { id: transcribed.id, timestamp: transcribed.timestamp, text: transcribed.text, status: 'pending' }
+      setItems(prev => [...prev, pending])
+      // Timeout: if no classified event arrives within 5s, mark as unclassified
+      const timer = setTimeout(() => {
+        timeoutsRef.current.delete(transcribed.id)
+        setItems(prev => prev.map(item =>
+          item.id === transcribed.id && 'status' in item ? { ...item, status: 'unclassified' as const } : item
+        ))
+      }, CLASSIFY_TIMEOUT_MS)
+      timeoutsRef.current.set(transcribed.id, timer)
+    })
+
+    const cleanupError = ipc.session.onError((msg: string) => {
+      setErrorMessage(msg)
+      setTimeout(() => setErrorMessage(null), 8000)
+    })
+
+    return () => { cleanupEvent(); cleanupTranscribed(); cleanupError() }
+  }, [])
+
+  const handleStart = useCallback(async () => {
+    try {
+      const settings = await ipc.settings.load()
+      if (!settings.activeCampaignId) { setErrorMessage('Please select a campaign in Settings first.'); return }
+      const id = await ipc.session.start(settings.activeCampaignId)
+      setSessionId(id)
+      setItems([])
+      setSessionActive(true)
+    } catch (err) {
+      setErrorMessage((err as Error).message)
+    }
+  }, [])
+
+  const handleStop = useCallback(async () => {
+    timeoutsRef.current.forEach(t => clearTimeout(t))
+    timeoutsRef.current.clear()
+    await ipc.session.stop()
+    setSessionActive(false)
+  }, [])
+
+  return (
+    <div className="flex flex-col h-full p-6 gap-4">
+      {errorMessage && (
+        <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-4 py-2 text-sm text-destructive">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          {errorMessage}
+        </div>
+      )}
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Session</h1>
+        <Button
+          size="lg"
+          variant={sessionActive ? 'destructive' : 'default'}
+          onClick={sessionActive ? handleStop : handleStart}
+          className="gap-2"
+        >
+          {sessionActive ? <><MicOff className="h-4 w-4" /> Stop Session</> : <><Mic className="h-4 w-4" /> Start Session</>}
+        </Button>
+      </div>
+      <div className="flex-1 rounded-lg border bg-muted/20 overflow-hidden">
+        <LiveTranscript items={items} />
+      </div>
+    </div>
+  )
+}
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/renderer/components/TranscriptEntry.tsx src/renderer/components/LiveTranscript.tsx src/renderer/pages/Home.tsx src/main/pipeline/sessionPipeline.ts src/main/ipc/handlers.ts src/preload/index.ts src/renderer/lib/ipc.ts
+git commit -m "feat: two-stage transcript (pending→classified) with error display"
+```
+
+---
+
+### Task 9: Run full test suite and push
 
 - [ ] **Step 1: Run all tests**
 
@@ -1123,3 +1423,25 @@ Expected: Clean build.
 ```bash
 git push origin plans
 ```
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | resolved | Gaps applied; cherry-picks incorporated |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | resolved | 3 bugs fixed; Task 8 (two-stage transcript + error display) added |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+
+**FIXES APPLIED:**
+- Bug: `modelPath: settings.transcriptionQuality` replaced with `modelManager.getModelPath(quality)` — was passing quality enum as a file path
+- Bug: `naudiodon.AudioIO` constructor wrapped in try/catch with friendly "Microphone not found" error
+- Bug: `EventBus` imported statically in session:start (was dynamic `await import()`)
+- Added: `bus.on('error', ...)` wired to `webContents.send('session:error', ...)` (CEO Gap 1)
+- Added: `session:error` IPC channel in preload and renderer
+- Added: Model presence pre-flight check in `session:start` before starting mic
+- Added: Task 8 — two-stage transcript state machine (pending→classified→unclassified) with error toast UI
+
+**VERDICT:** ENG REVIEW COMPLETE — plan ready for implementation.
